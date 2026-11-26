@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import traceback
 from datetime import datetime, timezone
@@ -27,6 +28,8 @@ DEFAULT_DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".loca
 DEFAULT_DB = Path(os.environ.get("HCWEBHOOK_DB", str(DEFAULT_DATA_DIR / "health_connect.sqlite"))).expanduser()
 DEFAULT_TOKEN_FILE = Path(os.environ.get("HCWEBHOOK_TOKEN_FILE", str(DEFAULT_DATA_DIR / "webhook_token"))).expanduser()
 DEFAULT_LOG = Path(os.environ.get("HCWEBHOOK_LOG", str(DEFAULT_DATA_DIR / "receiver.log"))).expanduser()
+
+_FRAC_SEC_RE = re.compile(r"\.(\d+)(?=(?:[+-]\d\d:?\d\d|Z)?$)")
 
 
 def utc_now() -> str:
@@ -78,11 +81,19 @@ def init_db(db_path: Path) -> None:
                 duration_seconds REAL,
                 stage_count INTEGER,
                 stages_json TEXT,
+                record_id TEXT,
+                last_modified_time TEXT,
                 UNIQUE(person, session_start, session_end),
                 FOREIGN KEY(raw_event_id) REFERENCES raw_events(id)
             )
             """
         )
+        sleep_cols = {row[1] for row in con.execute("PRAGMA table_info(sleep_sessions)").fetchall()}
+        if "record_id" not in sleep_cols:
+            con.execute("ALTER TABLE sleep_sessions ADD COLUMN record_id TEXT")
+        if "last_modified_time" not in sleep_cols:
+            con.execute("ALTER TABLE sleep_sessions ADD COLUMN last_modified_time TEXT")
+
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS vitals (
@@ -149,6 +160,10 @@ def init_db(db_path: Path) -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_vitals_person_metric_time ON vitals(person, metric, time)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_sleep_person_end ON sleep_sessions(person, session_end)")
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sleep_person_record_id "
+            "ON sleep_sessions(person, record_id) WHERE record_id IS NOT NULL"
+        )
         con.execute("CREATE INDEX IF NOT EXISTS idx_daily_activity_person_metric_date ON daily_activity(person, metric, date)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_activity_intervals_person_metric_start ON activity_intervals(person, metric, start_time)")
 
@@ -158,6 +173,19 @@ def as_float(x):
         if x is None:
             return None
         return float(x)
+    except Exception:
+        return None
+
+
+def _iso_to_epoch(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        s = str(ts).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        s = _FRAC_SEC_RE.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), s)
+        return datetime.fromisoformat(s).timestamp()
     except Exception:
         return None
 
@@ -183,29 +211,159 @@ def _normalize_payload(con: sqlite3.Connection, raw_event_id: int, person: str, 
             if starts:
                 session_start = min(starts)
         if not session_start and session_end and sleep.get("duration_seconds") is not None:
-            try:
-                end_dt = datetime.fromisoformat(session_end.replace("Z", "+00:00"))
-                session_start = end_dt.timestamp() - float(sleep.get("duration_seconds"))
-                session_start = datetime.fromtimestamp(session_start, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-            except Exception:
-                pass
+            end_ts = _iso_to_epoch(session_end)
+            dur_val = as_float(sleep.get("duration_seconds"))
+            if end_ts is not None and dur_val is not None:
+                session_start = datetime.fromtimestamp(end_ts - dur_val, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+        duration = as_float(sleep.get("duration_seconds"))
+        stage_count = len(stages) if isinstance(stages, list) else None
+        stages_text = json.dumps(stages, ensure_ascii=False)
+        meta = sleep.get("metadata") if isinstance(sleep.get("metadata"), dict) else {}
+        record_id = meta.get("id") or meta.get("client_record_id")
+        last_modified_time = meta.get("last_modified_time")
+
+        start_ep = _iso_to_epoch(session_start)
+        end_ep = _iso_to_epoch(session_end)
+        new_lmt_ep = _iso_to_epoch(last_modified_time)
+        new_span = (end_ep - start_ep) if (start_ep is not None and end_ep is not None and end_ep > start_ep) else 0.0
+
+        sleep_seen += 1
+
+        # 1. Primary path: match Health Connect record_id and trust last_modified_time
+        if record_id:
+            existing = con.execute(
+                """
+                SELECT id, session_start, session_end, duration_seconds, stage_count, last_modified_time
+                FROM sleep_sessions
+                WHERE person = ? AND record_id = ?
+                """,
+                (person, record_id),
+            ).fetchone()
+            if existing:
+                ex_id, ex_start, ex_end, ex_dur, ex_stages, ex_lmt = existing
+                ex_lmt_ep = _iso_to_epoch(ex_lmt)
+                should_update = False
+                if new_lmt_ep is not None and ex_lmt_ep is not None:
+                    should_update = new_lmt_ep > ex_lmt_ep
+                elif new_lmt_ep is not None and ex_lmt_ep is None:
+                    should_update = True
+                elif new_lmt_ep is None and ex_lmt_ep is None:
+                    ex_start_ep = _iso_to_epoch(ex_start) or 0.0
+                    ex_end_ep = _iso_to_epoch(ex_end) or 0.0
+                    ex_span = max(0.0, ex_end_ep - ex_start_ep)
+                    ex_score = (ex_dur if ex_dur is not None else ex_span, ex_span, ex_stages or 0)
+                    new_score_no_id = (duration if duration is not None else new_span, new_span, stage_count or 0)
+                    should_update = new_score_no_id > ex_score
+
+                if should_update:
+                    # Remove any other overlapping/identical rows so the finalized update cannot double-count or violate UNIQUE
+                    if start_ep is not None and end_ep is not None and end_ep > start_ep:
+                        con.execute(
+                            """
+                            DELETE FROM sleep_sessions
+                            WHERE person = ? AND id != ?
+                              AND session_start IS NOT NULL AND session_end IS NOT NULL
+                              AND CAST(strftime('%s', session_start) AS REAL) < ?
+                              AND CAST(strftime('%s', session_end) AS REAL) > ?
+                            """,
+                            (person, ex_id, end_ep, start_ep),
+                        )
+                    if session_start is not None and session_end is not None:
+                        con.execute(
+                            """
+                            DELETE FROM sleep_sessions
+                            WHERE person = ? AND id != ?
+                              AND session_start = ? AND session_end = ?
+                            """,
+                            (person, ex_id, session_start, session_end),
+                        )
+                    cur = con.execute(
+                        """
+                        UPDATE sleep_sessions
+                        SET raw_event_id = ?,
+                            session_start = ?,
+                            session_end = ?,
+                            duration_seconds = ?,
+                            stage_count = ?,
+                            stages_json = ?,
+                            last_modified_time = COALESCE(?, last_modified_time)
+                        WHERE id = ?
+                        """,
+                        (
+                            raw_event_id,
+                            session_start,
+                            session_end,
+                            duration,
+                            stage_count,
+                            stages_text,
+                            last_modified_time,
+                            ex_id,
+                        ),
+                    )
+                    sleep_inserted += cur.rowcount
+                continue
+
+        # 2. Fallback path: deduplicate overlapping intervals (bedtime drift, legacy rows without record_id, multiple apps)
+        if start_ep is not None and end_ep is not None and end_ep > start_ep:
+            overlaps = con.execute(
+                """
+                SELECT id, session_start, session_end, duration_seconds, stage_count, record_id
+                FROM sleep_sessions
+                WHERE person = ?
+                  AND session_start IS NOT NULL
+                  AND session_end IS NOT NULL
+                  AND CAST(strftime('%s', session_start) AS REAL) < ?
+                  AND CAST(strftime('%s', session_end) AS REAL) > ?
+                """,
+                (person, end_ep, start_ep),
+            ).fetchall()
+
+            if overlaps:
+                new_score = (
+                    duration if duration is not None else new_span,
+                    new_span,
+                    stage_count or 0,
+                    1 if record_id else 0,
+                )
+                best_existing = max(
+                    (
+                        (
+                            r[3] if r[3] is not None else max(0.0, (_iso_to_epoch(r[2]) or 0.0) - (_iso_to_epoch(r[1]) or 0.0)),
+                            max(0.0, (_iso_to_epoch(r[2]) or 0.0) - (_iso_to_epoch(r[1]) or 0.0)),
+                            r[4] or 0,
+                            1 if r[5] else 0,
+                        )
+                        for r in overlaps
+                    )
+                )
+                if new_score > best_existing or (len(overlaps) > 1 and new_score >= best_existing):
+                    placeholders = ",".join("?" for _ in overlaps)
+                    con.execute(
+                        f"DELETE FROM sleep_sessions WHERE id IN ({placeholders})",
+                        [r[0] for r in overlaps],
+                    )
+                else:
+                    continue
+
         cur = con.execute(
             """
             INSERT OR IGNORE INTO sleep_sessions
-              (raw_event_id, person, session_start, session_end, duration_seconds, stage_count, stages_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+              (raw_event_id, person, session_start, session_end, duration_seconds, stage_count, stages_json, record_id, last_modified_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raw_event_id,
                 person,
                 session_start,
                 session_end,
-                as_float(sleep.get("duration_seconds")),
-                len(stages) if isinstance(stages, list) else None,
-                json.dumps(stages, ensure_ascii=False),
+                duration,
+                stage_count,
+                stages_text,
+                record_id,
+                last_modified_time,
             ),
         )
-        sleep_seen += 1
         sleep_inserted += cur.rowcount
 
     vital_specs = {
